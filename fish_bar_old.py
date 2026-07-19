@@ -376,6 +376,15 @@ def run_moon_action(sct):
         time.sleep(MOON_ACTION_CLICK_BREAK_SECONDS)
 
 
+def prompt_day_cycle_enabled():
+    answer = input("Enable the day/night moon check? (yes/no): ").strip().lower()
+    if answer in ("yes", "y"):
+        print("okay, day cycle check enabled")
+        return True
+    print("alright, day cycle check disabled")
+    return False
+
+
 def wait_while_paused_or_unfocused():
     """Blocks (checking for stop) while paused or the target app isn't
     frontmost. Returns False if we should abort entirely (ESC hit)."""
@@ -516,13 +525,17 @@ def run_control_until_gone(sct):
 
 
 def main():
+    day_cycle_enabled = prompt_day_cycle_enabled()
+
     for i in range(3, 0, -1):
         print(i)
         time.sleep(1)
 
     print("Autonomous bar bot running. F8 = pause/resume, ESC = quit.")
 
-    moon_template = load_moon_template()
+    # Skip loading the template entirely if the check's disabled, so
+    # there's no reason to ever bother running it below.
+    moon_template = load_moon_template() if day_cycle_enabled else None
     session_count = 0
 
     with mss.mss() as sct:
@@ -530,7 +543,7 @@ def main():
             if not wait_while_paused_or_unfocused():
                 break
 
-            if session_count >= SESSIONS_BETWEEN_MOON_CHECKS:
+            if day_cycle_enabled and session_count >= SESSIONS_BETWEEN_MOON_CHECKS:
                 session_count = 0
                 if is_moon_visible(sct, moon_template):
                     run_moon_action(sct)
