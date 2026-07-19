@@ -9,12 +9,16 @@ straight into the day-cycle check once detection is confirmed working.
 FULL LOOP THIS RUNS
 ---------------------
 1. Every CHECK_INTERVAL_SECONDS (1s), screenshot the moon-check region
-   and run template matching against moon.png.
+   and run template matching against moon.png. This runs regardless of
+   which app is frontmost — you're meant to be watching THIS console
+   while it runs, not the game, so scanning is never gated on focus.
 2. Print the match score and a DETECTED/not detected verdict every
    check, so you can watch it live and confirm detection actually
    tracks the real moon icon appearing/disappearing on screen.
 3. On the RISING EDGE only (moon just became visible, not every single
-   check while it stays visible) — press 5, then press Space.
+   check while it stays visible) — press 5, then press Space. This
+   part DOES require Roblox to be frontmost (skipped with a message if
+   not), since unlike scanning it actually sends input somewhere.
 4. Repeat forever until you hit ESC.
 
 pip install mss numpy opencv-python pynput
@@ -125,10 +129,15 @@ def frontmost_app_ok():
     return ok
 
 
-def wait_while_paused_or_unfocused():
-    """Blocks (checking for stop) while paused or the target app isn't
-    frontmost. Returns False if we should abort entirely (ESC hit)."""
-    while not _stopped and (_paused or not frontmost_app_ok()):
+def wait_while_paused():
+    """Blocks (checking for stop) while paused. Returns False if we
+    should abort entirely (ESC hit). Deliberately does NOT require
+    Roblox to be frontmost — this script only scans/prints, it doesn't
+    send any input, so there's no reason to block the whole scan loop
+    on focus (you're meant to be watching this console output, not the
+    game, while it runs). Focus is instead only checked right before
+    the actual 5+Space action fires — see main()."""
+    while not _stopped and _paused:
         time.sleep(0.05)
     return not _stopped
 
@@ -237,7 +246,7 @@ def main():
 
     with mss.mss() as sct:
         while not _stopped:
-            if not wait_while_paused_or_unfocused():
+            if not wait_while_paused():
                 break
 
             score = moon_match_score(sct, template)
@@ -252,7 +261,12 @@ def main():
 
                 if is_visible and not was_visible:
                     print()  # keep the action's own prints on fresh lines
-                    run_moon_action()
+                    if frontmost_app_ok():
+                        run_moon_action()
+                    else:
+                        print("[moon] detected, but Roblox isn't frontmost — "
+                              "skipping the 5+Space action to avoid sending it "
+                              "to the wrong window.")
 
                 was_visible = is_visible
 
