@@ -27,12 +27,13 @@ region (the whole bar).
   - control bar/pin not found yet (before first appearance, or a
     mid-check detection blip) -> jitter-click on the keep-alive
     cadence so position is never just left to drift while blind.
-  - pin at/left of the control bar's dead center -> do nothing this
-    frame, let the constant leftward pull carry the bar back down
-    until it's centered over the pin again.
-  - pin at/right of center -> fire one short, fixed-length tap (never
-    a longer hold, no matter how far right it is), then immediately
-    re-read the next frame and decide again.
+  - pin at/left of the control bar's target point (PIN_TARGET_FRACTION
+    of the way across the bar, not necessarily dead center) -> do
+    nothing this frame, let the constant leftward pull carry the bar
+    back down until the target point is back over the pin.
+  - pin at/right of the target point -> fire one short, fixed-length
+    tap (never a longer hold, no matter how far right it is), then
+    immediately re-read the next frame and decide again.
   - either way, if it's been more than KEEPALIVE_TAP_INTERVAL since
     the last tap, tap anyway — the leftward pull would otherwise keep
     accelerating unchecked while coasting.
@@ -96,17 +97,21 @@ NEEDLE_HSV_HIGH = np.array([125, 150, 160])
 # many rapid pulses.
 HOLD_KEY = pynput_keyboard.Key.space
 
+# Where along the control bar's width the pin should be held, as a
+# fraction from the left edge (0.0) to the right edge (1.0). Used to be
+# pinned to dead center (0.5) — now aimed at 4/9 instead.
+PIN_TARGET_FRACTION = 4 / 9
+
 # SIMPLE CONTROL RULE:
-#   pin left of (or at) the control bar's center -> do nothing this
-#     frame, UNLESS it's been more than KEEPALIVE_TAP_INTERVAL since
-#     the last tap — the leftward pull otherwise keeps accelerating
-#     unchecked.
-#   pin right of (or at) center -> tap for a fixed, constant duration
-#     (never scaled by distance), then re-check next frame.
+#   pin left of (or at) the target point -> do nothing this frame,
+#     UNLESS it's been more than KEEPALIVE_TAP_INTERVAL since the last
+#     tap — the leftward pull otherwise keeps accelerating unchecked.
+#   pin right of (or at) the target point -> tap for a fixed, constant
+#     duration (never scaled by distance), then re-check next frame.
 # The same keep-alive cadence is also what's used to jitter-click
 # before the whole bar has appeared at all — see run_control_until_gone().
 TAP_SECONDS = 0.02  # length of each tap — bumped up slightly from 0.01 for a bit more push per tap
-KEEPALIVE_TAP_INTERVAL = 0.2  # max time allowed between taps, even while "coasting"
+KEEPALIVE_TAP_INTERVAL = 0.15  # max time allowed between taps, even while "coasting"
 
 # How many consecutive "not found" frames after the whole bar has
 # already been seen once before we decide the check has actually ended
@@ -366,17 +371,18 @@ def run_control_until_gone(sct):
                 print("Whole bar appeared — engaging reactive control.")
             bar_seen = True
             missing_count = 0
-            bar_left, bar_right, bar_center = bar
+            bar_left, bar_right, _ = bar
             _, _, needle_center = needle
+            bar_target = bar_left + PIN_TARGET_FRACTION * (bar_right - bar_left)
 
-            error = needle_center - bar_center
+            error = needle_center - bar_target
             now = time.time()
 
             if error >= 0 or (now - last_tap_time) >= KEEPALIVE_TAP_INTERVAL:
-                # pin at/right of the control bar's dead center -> tap.
-                # Also tap on a keep-alive timer even when left of
-                # center, so the leftward pull never gets long enough
-                # to keep accelerating.
+                # pin at/right of the target point -> tap. Also tap on
+                # a keep-alive timer even when left of it, so the
+                # leftward pull never gets long enough to keep
+                # accelerating.
                 kb.press(HOLD_KEY)
                 time.sleep(TAP_SECONDS)
                 kb.release(HOLD_KEY)
