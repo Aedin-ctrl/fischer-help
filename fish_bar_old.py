@@ -16,8 +16,12 @@ FULL LOOP THIS RUNS
    only ever evaluated after the bar has been seen at least once, so
    "hasn't appeared yet" can never be mistaken for "the check is
    already over."
-4. Once the bar is gone, wait 1s, then go back to step 1. Forever,
-   until you hit ESC.
+4. Once the bar is gone, wait 1s. Every SESSIONS_BETWEEN_MOON_CHECKS
+   completed sessions, before the NEXT cast: check for the moon icon,
+   press 5 then Space if it's there, then always wait a full
+   MOON_CHECK_PRE_CAST_DELAY_SECONDS (1s) before that next cast starts
+   regardless of whether the moon was actually found. Then go back to
+   step 1. Forever, until you hit ESC.
 
 CONTROL LOGIC (simple, on purpose)
 ------------------------------------
@@ -52,6 +56,7 @@ F8  = pause/resume the whole loop (safe to hit anytime)
 ESC = quit immediately (always releases the mouse/key first)
 """
 
+import os
 import time
 import numpy as np
 import cv2
@@ -155,6 +160,37 @@ POST_CHECK_DELAY_SECONDS = 1.0
 # stuck/missed check.
 CONTROL_TIMEOUT_SECONDS = 25.0
 
+# Day/night cycle: every this-many completed cast+control sessions,
+# check for the moon icon right before the next cast (see MOON CHECK
+# below). Detection + the 5/Space action were validated separately in
+# moon_test.py before being wired in here.
+SESSIONS_BETWEEN_MOON_CHECKS = 5
+
+# The two corners pointed at on screen for the moon check. The box they
+# define is smaller than the actual moon icon artwork (once its
+# transparent padding is cropped off), so a margin is added around it
+# below to make sure the icon fits inside the searched region
+# regardless of a few pixels of drift.
+MOON_CHECK_CORNER_A = (1430, 848)
+MOON_CHECK_CORNER_B = (1316, 811)
+MOON_CHECK_MARGIN = 40
+
+# cv2.matchTemplate (TM_CCOEFF_NORMED) score cutoff to call it "yes,
+# that's the moon." 1.0 = pixel-perfect match. This is the plain
+# unmasked match — confirmed working in moon_test.py.
+MOON_MATCH_THRESHOLD = 0.6
+
+MOON_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moon.png")
+
+# After the moon check (whether or not the moon was actually found),
+# wait this long before the next cast starts.
+MOON_CHECK_PRE_CAST_DELAY_SECONDS = 1.0
+
+# macOS virtual keycode for '5', same reasoning as the vk usage above:
+# raw keyCode events are what Roblox hotbar shortcuts expect.
+_VK_5 = 0x17
+MOON_ACTION_KEY_HOLD_SECONDS = 0.1  # how long each key-down is held before release
+
 # ----------------------------------------------------------------------
 
 mouse = MouseController()
@@ -253,6 +289,64 @@ def sample_unrecognized_color(hsv):
         return None
     pixels = hsv[ys, xs]
     return tuple(pixels.min(axis=0)), tuple(pixels.max(axis=0))
+
+
+def load_moon_template():
+    """Loads moon.png and crops it down to just its opaque pixels (it has
+    transparent padding around the actual icon), so matchTemplate is
+    comparing against the icon shape itself rather than empty margin."""
+    img = cv2.imread(MOON_TEMPLATE_PATH, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"[moon] couldn't load {MOON_TEMPLATE_PATH} — moon-check disabled")
+        return None
+    if img.ndim == 3 and img.shape[2] == 4:
+        ys, xs = np.where(img[:, :, 3] > 10)
+        if len(xs):
+            img = img[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        img = img[:, :, :3]
+    return img
+
+
+def moon_check_region():
+    (x1, y1), (x2, y2) = MOON_CHECK_CORNER_A, MOON_CHECK_CORNER_B
+    left, right = sorted((x1, x2))
+    top, bottom = sorted((y1, y2))
+    left -= MOON_CHECK_MARGIN
+    top -= MOON_CHECK_MARGIN
+    right += MOON_CHECK_MARGIN
+    bottom += MOON_CHECK_MARGIN
+    return {"left": left, "top": top, "width": right - left, "height": bottom - top}
+
+
+def is_moon_visible(sct, template):
+    if template is None:
+        return False
+    frame = np.asarray(sct.grab(moon_check_region()))
+    bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    th, tw = template.shape[:2]
+    if bgr.shape[0] < th or bgr.shape[1] < tw:
+        return False
+    result = cv2.matchTemplate(bgr, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(result)
+    return max_val >= MOON_MATCH_THRESHOLD
+
+
+def tap_vk(vk_code, label, hold_seconds=MOON_ACTION_KEY_HOLD_SECONDS):
+    key = pynput_keyboard.KeyCode(vk=vk_code)
+    print(f"  pressing '{label}'...")
+    kb.press(key)
+    time.sleep(hold_seconds)
+    kb.release(key)
+
+
+def run_moon_action():
+    """Moon icon spotted on the every-Nth-session check — press 5, then
+    Space."""
+    print("\nMoon detected — pressing 5, then Space...")
+    tap_vk(_VK_5, "5")
+    kb.press(pynput_keyboard.Key.space)
+    time.sleep(MOON_ACTION_KEY_HOLD_SECONDS)
+    kb.release(pynput_keyboard.Key.space)
 
 
 def wait_while_paused_or_unfocused():
@@ -401,16 +495,28 @@ def main():
 
     print("Autonomous bar bot running. F8 = pause/resume, ESC = quit.")
 
+    moon_template = load_moon_template()
+    session_count = 0
+
     with mss.mss() as sct:
         while not _stopped:
             if not wait_while_paused_or_unfocused():
                 break
+
+            if session_count >= SESSIONS_BETWEEN_MOON_CHECKS:
+                session_count = 0
+                if is_moon_visible(sct, moon_template):
+                    run_moon_action()
+                # Full delay before the cast either way -- whether or
+                # not the moon was actually found this time.
+                time.sleep(MOON_CHECK_PRE_CAST_DELAY_SECONDS)
 
             run_trigger_sequence()
             if _stopped:
                 break
 
             run_control_until_gone(sct)
+            session_count += 1
 
             slept = 0.0
             while slept < POST_CHECK_DELAY_SECONDS and not _stopped:
