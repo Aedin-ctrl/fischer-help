@@ -236,6 +236,10 @@ def main():
     if template is None:
         return
 
+    for i in range(3, 0, -1):
+        print(i)
+        time.sleep(1)
+
     print(f"[moon] search region: {moon_check_region()}")
     print(f"[moon] match threshold: {MOON_MATCH_THRESHOLD}")
     print(f"[moon] saving each captured frame to: {CAPTURE_DEBUG_PATH}")
