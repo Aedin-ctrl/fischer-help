@@ -65,6 +65,7 @@ MOON_CHECK_MARGIN = 40
 MOON_MATCH_THRESHOLD = 0.6
 
 MOON_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moon.png")
+CAPTURE_DEBUG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moon_test_capture.png")
 
 # How often frontmost_app_ok() actually re-queries the OS (via a real
 # ObjC/WindowServer round-trip) vs. reusing the last answer.
@@ -159,11 +160,43 @@ def moon_check_region():
     return {"left": left, "top": top, "width": right - left, "height": bottom - top}
 
 
+def diagnose_frame(bgr, requested_region):
+    """Flags the two most likely reasons detection silently fails:
+    a blank/black capture (Screen Recording permission not granted to
+    whatever app is running this) or a size mismatch between what was
+    requested and what was actually returned (a known mss/macOS Retina
+    scaling gotcha — the region can come back at e.g. 2x the requested
+    width/height, which throws off template matching even if the
+    region position itself is correct)."""
+    got_h, got_w = bgr.shape[:2]
+    want_w, want_h = requested_region["width"], requested_region["height"]
+    if (got_w, got_h) != (want_w, want_h):
+        print(f"\n[moon] WARNING: requested a {want_w}x{want_h} region but got back "
+              f"{got_w}x{got_h} — likely a Retina/display-scaling mismatch. The region "
+              f"position may still be right, but matchTemplate needs the template and "
+              f"the live capture at the same scale.")
+
+    mean = bgr.mean()
+    std = bgr.std()
+    if std < 3.0:
+        print(f"\n[moon] WARNING: captured region looks blank/uniform (mean={mean:.1f}, "
+              f"std={std:.1f}) — check Screen Recording permission for whatever app is "
+              f"running this script (System Settings -> Privacy & Security), or confirm "
+              f"the region isn't pointing off-screen.")
+
+
 def moon_match_score(sct, template):
     """Returns the raw match score (or None if the region is too small
-    to match at all), so main() can print it every single check."""
-    frame = np.asarray(sct.grab(moon_check_region()))
+    to match at all), so main() can print it every single check. Also
+    saves the captured region to CAPTURE_DEBUG_PATH and runs
+    diagnose_frame() every call, so a failure to detect can actually be
+    diagnosed instead of guessed at."""
+    region = moon_check_region()
+    frame = np.asarray(sct.grab(region))
     bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    cv2.imwrite(CAPTURE_DEBUG_PATH, bgr)
+    diagnose_frame(bgr, region)
+
     th, tw = template.shape[:2]
     if bgr.shape[0] < th or bgr.shape[1] < tw:
         return None
@@ -196,6 +229,7 @@ def main():
 
     print(f"[moon] search region: {moon_check_region()}")
     print(f"[moon] match threshold: {MOON_MATCH_THRESHOLD}")
+    print(f"[moon] saving each captured frame to: {CAPTURE_DEBUG_PATH}")
     print("Scanning for the moon every "
           f"{CHECK_INTERVAL_SECONDS:.1f}s. F8 = pause/resume, ESC = quit.\n")
 
