@@ -57,6 +57,7 @@ ESC = quit immediately (always releases the mouse/key first)
 """
 
 import os
+import random
 import time
 import numpy as np
 import cv2
@@ -190,6 +191,16 @@ MOON_CHECK_PRE_CAST_DELAY_SECONDS = 1.0
 # raw keyCode events are what Roblox hotbar shortcuts expect.
 _VK_5 = 0x17
 MOON_ACTION_KEY_HOLD_SECONDS = 0.1  # how long each key-down is held before release
+
+# A plain Space tap after pressing 5 wasn't being recognized -- what's
+# actually needed is a real mouse click-and-hold near screen center,
+# repeated a few times with a random position jitter each time (rather
+# than the exact same pixel every time) in case dead center isn't
+# clickable for whatever's on screen at that moment.
+MOON_ACTION_CLICK_COUNT = 4
+MOON_ACTION_CLICK_HOLD_SECONDS = 0.2
+MOON_ACTION_CLICK_BREAK_SECONDS = 0.5
+MOON_ACTION_CLICK_JITTER_PX = 50  # max random offset from center, in each direction
 
 # ----------------------------------------------------------------------
 
@@ -339,14 +350,30 @@ def tap_vk(vk_code, label, hold_seconds=MOON_ACTION_KEY_HOLD_SECONDS):
     kb.release(key)
 
 
-def run_moon_action():
+def run_moon_action(sct):
     """Moon icon spotted on the every-Nth-session check — press 5, then
-    Space."""
-    print("\nMoon detected — pressing 5, then Space...")
+    click-and-hold near screen center MOON_ACTION_CLICK_COUNT times,
+    each at a randomly jittered position, holding
+    MOON_ACTION_CLICK_HOLD_SECONDS with a MOON_ACTION_CLICK_BREAK_SECONDS
+    break in between."""
+    print("\nMoon detected — pressing 5, then clicking...")
     tap_vk(_VK_5, "5")
-    kb.press(pynput_keyboard.Key.space)
-    time.sleep(MOON_ACTION_KEY_HOLD_SECONDS)
-    kb.release(pynput_keyboard.Key.space)
+
+    monitor = sct.monitors[1]
+    center_x = monitor["left"] + monitor["width"] // 2
+    center_y = monitor["top"] + monitor["height"] // 2
+
+    for i in range(MOON_ACTION_CLICK_COUNT):
+        if _stopped:
+            return
+        x = center_x + random.randint(-MOON_ACTION_CLICK_JITTER_PX, MOON_ACTION_CLICK_JITTER_PX)
+        y = center_y + random.randint(-MOON_ACTION_CLICK_JITTER_PX, MOON_ACTION_CLICK_JITTER_PX)
+        print(f"  click {i + 1}/{MOON_ACTION_CLICK_COUNT} at ({x}, {y})...")
+        mouse.position = (x, y)
+        mouse.press(Button.left)
+        time.sleep(MOON_ACTION_CLICK_HOLD_SECONDS)
+        mouse.release(Button.left)
+        time.sleep(MOON_ACTION_CLICK_BREAK_SECONDS)
 
 
 def wait_while_paused_or_unfocused():
@@ -506,7 +533,7 @@ def main():
             if session_count >= SESSIONS_BETWEEN_MOON_CHECKS:
                 session_count = 0
                 if is_moon_visible(sct, moon_template):
-                    run_moon_action()
+                    run_moon_action(sct)
                 # Full delay before the cast either way -- whether or
                 # not the moon was actually found this time.
                 time.sleep(MOON_CHECK_PRE_CAST_DELAY_SECONDS)
