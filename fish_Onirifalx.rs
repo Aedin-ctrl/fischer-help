@@ -467,14 +467,25 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
                 if bar_width > 0.0 {
                     let release_edge = bar.left + RELEASE_FRACTION * bar_width;
                     let hold_edge = bar.right - HOLD_FRACTION * bar_width;
-                    if pin.center >= hold_edge {
-                        heading = Side::Right;
+                    let new_heading = if pin.center >= hold_edge {
+                        Side::Right
                     } else if pin.center <= release_edge {
-                        heading = Side::Left;
+                        Side::Left
+                    } else {
+                        heading // middle 1/5 -- leave heading as-is
+                    };
+                    // set_heading() calls key_down/key_up, each of which
+                    // fires a brand-new synthetic key event -- calling it
+                    // every tick even while the heading hasn't changed
+                    // spams repeated KeyPress events instead of one
+                    // continuous hold, which the game reads as rapid
+                    // clicking rather than holding the key down. Only
+                    // call it on an actual transition.
+                    if new_heading != heading {
+                        heading = new_heading;
+                        set_heading(heading);
                     }
-                    // else: pin is in the middle 1/5 -- leave heading as-is.
                 }
-                set_heading(heading);
                 print_status(&format!(
                     "[track] bar={:.0}-{:.0} pin={:.0} heading={heading:?} streak={confirm_streak}",
                     bar.left, bar.right, pin.center
