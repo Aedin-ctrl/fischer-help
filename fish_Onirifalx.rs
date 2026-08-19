@@ -408,6 +408,10 @@ const MISSING_GRACE: Duration = Duration::from_millis(1200);
 /// Consecutive ticks bar+pin must both be detected together before it's
 /// trusted as a real bite rather than a single-frame false positive.
 const CONFIRM_STREAK_REQUIRED: u32 = 4;
+/// Consecutive ticks a zone crossing (release <-> hold) must hold before
+/// the key is actually pressed/released -- filters a single noisy frame
+/// from flipping the key on bar-edge measurement jitter.
+const ZONE_CHANGE_CONFIRM_TICKS: u32 = 2;
 
 fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
     println!("Pin-tracking control engaged (bar + pin color detection)...");
@@ -423,6 +427,15 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
     let mut confirm_streak = 0u32;
     let mut missing_since: Option<Instant> = None;
     let session_start = Instant::now();
+    // A crossing into a new zone (release/hold) has to hold for
+    // ZONE_CHANGE_CONFIRM_TICKS consecutive ticks before it's acted on --
+    // the bar's measured edges jitter frame to frame (observed swings of
+    // 50-100px between consecutive reads on a bar that wasn't actually
+    // moving that much), so release_edge/hold_edge computed fresh each
+    // tick can occasionally misclassify a single noisy frame, triggering
+    // a real but spurious press.
+    let mut pending_heading: Option<Side> = None;
+    let mut pending_streak = 0u32;
 
     loop {
         if !stay_active() {
@@ -474,16 +487,28 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
                     } else {
                         heading // middle 1/5 -- leave heading as-is
                     };
-                    // set_heading() calls key_down/key_up, each of which
-                    // fires a brand-new synthetic key event -- calling it
-                    // every tick even while the heading hasn't changed
-                    // spams repeated KeyPress events instead of one
-                    // continuous hold, which the game reads as rapid
-                    // clicking rather than holding the key down. Only
-                    // call it on an actual transition.
-                    if new_heading != heading {
-                        heading = new_heading;
-                        set_heading(heading);
+                    if new_heading == heading {
+                        pending_heading = None;
+                        pending_streak = 0;
+                    } else if pending_heading == Some(new_heading) {
+                        pending_streak += 1;
+                        if pending_streak >= ZONE_CHANGE_CONFIRM_TICKS {
+                            // set_heading() calls key_down/key_up, each of
+                            // which fires a brand-new synthetic key event --
+                            // calling it every tick even while the heading
+                            // hasn't changed spams repeated KeyPress events
+                            // instead of one continuous hold, which the
+                            // game reads as rapid clicking rather than
+                            // holding the key down. Only call it once the
+                            // crossing is confirmed.
+                            heading = new_heading;
+                            set_heading(heading);
+                            pending_heading = None;
+                            pending_streak = 0;
+                        }
+                    } else {
+                        pending_heading = Some(new_heading);
+                        pending_streak = 1;
                     }
                 }
                 print_status(&format!(
