@@ -645,6 +645,11 @@ fn main() -> anyhow::Result<()> {
                     println!("{NO_BITE_TIMEOUT_STOP_LIMIT} no-bite timeouts in a row -- stopping.");
                     break;
                 }
+                // A timeout with no bite at all can mean the rod never got
+                // properly re-seated after the last action -- press 9 then
+                // 1 again before the next cast, same as after totem/day-
+                // night/aquarium.
+                press_pre_trigger_keys();
             }
             ControlOutcome::Stopped => break,
         }
