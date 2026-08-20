@@ -167,6 +167,20 @@ fn prompt_day_night_preference() -> Option<DayNightPref> {
 /// for this run only -- the saved settings.toml value is untouched.
 const ENTER_COUNT_OVERRIDE: Option<u32> = Some(0);
 
+// ----------------------------------------------------------------------
+// PERIODIC ACTIONS -- time-based, not cast-count-based
+// ----------------------------------------------------------------------
+//
+// Cast duration varies a lot with this control loop (a quick miss vs. a
+// real fight), so "every N casts" doesn't land on a consistent real-world
+// cadence -- checked by elapsed time instead. Each timer is checked once
+// per loop iteration, right before the next cast (never mid-fight), so if
+// one fires while a long fight is still in progress, it just runs before
+// the next cast starts rather than interrupting anything.
+const DAY_NIGHT_CHECK_INTERVAL: Duration = Duration::from_secs(13 * 60);
+const AQUARIUM_BOOST_INTERVAL: Duration = Duration::from_secs(31 * 60);
+const TOTEM_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// Presses 9 then 1 (config::PRE_TRIGGER_KEYS) -- normally run before every
 /// single cast (see control::run_trigger_sequence), but here it's only
 /// wanted once at startup and again after anything that swaps hotbar slots
@@ -213,7 +227,8 @@ fn prompt_totem_preference() -> Option<Key> {
     io::stdin().read_line(&mut answer).ok();
     match answer.trim().parse::<u32>().ok().and_then(fish_bar_bot::settings::key_for_slot) {
         Some(key) => {
-            println!("okay, refreshing the totem every {TOTEM_INTERVAL} casts (starting cast {TOTEM_START_CAST})");
+            let mins = TOTEM_REFRESH_INTERVAL.as_secs() / 60;
+            println!("okay, refreshing the totem every {mins} minutes");
             Some(key)
         }
         None => {
@@ -223,10 +238,6 @@ fn prompt_totem_preference() -> Option<Key> {
     }
 }
 
-/// Every TOTEM_INTERVAL casts starting from TOTEM_START_CAST -- casts
-/// 4, 14, 24, ... not a plain modulo, since that would also fire on cast 0.
-const TOTEM_START_CAST: u32 = 4;
-const TOTEM_INTERVAL: u32 = 10;
 const TOTEM_KEY_HOLD: Duration = Duration::from_millis(120);
 const TOTEM_SWITCH_DELAY: Duration = Duration::from_millis(300);
 const TOTEM_CLICK_HOLD: Duration = Duration::from_millis(200);
@@ -647,6 +658,11 @@ fn main() -> anyhow::Result<()> {
     // retuning, etc.), not just bad luck, so the program stops instead of
     // casting forever into nothing.
     let mut consecutive_no_bite_timeouts: u32 = 0;
+    // Each starts at session_start, so the first check of each kind fires
+    // after its own full interval has elapsed, not immediately on cast 1.
+    let mut last_day_night_check = session_start;
+    let mut last_aquarium_boost = session_start;
+    let mut last_totem_refresh = session_start;
 
     while !input::is_stopped() {
         if !input::wait_while_paused_or_unfocused() {
@@ -657,7 +673,8 @@ fn main() -> anyhow::Result<()> {
         println!("\ncast {total_casts} | elapsed {}", format_elapsed(session_start.elapsed()));
         let settings = fish_bar_bot::settings::load();
 
-        if day_night_preference.is_some() && total_casts % settings.skip_day_night_count.max(1) == 0 {
+        if day_night_preference.is_some() && last_day_night_check.elapsed() >= DAY_NIGHT_CHECK_INTERVAL {
+            last_day_night_check = Instant::now();
             if icon_visible_with_retries(watch_template.as_ref()) {
                 let totem_key = fish_bar_bot::settings::key_for_slot(settings.skip_day_night_where).unwrap_or(Key::Num5);
                 let rod_key = fish_bar_bot::settings::key_for_slot(settings.rod_slot).unwrap_or(Key::Num1);
@@ -668,7 +685,8 @@ fn main() -> anyhow::Result<()> {
             thread::sleep(config::MOON_CHECK_PRE_CAST_DELAY);
         }
 
-        if settings.aquarium_boost_enabled && total_casts % settings.aquarium_boost_count.max(1) == 0 {
+        if settings.aquarium_boost_enabled && last_aquarium_boost.elapsed() >= AQUARIUM_BOOST_INTERVAL {
+            last_aquarium_boost = Instant::now();
             println!("\n{total_casts} casts done ({} elapsed) -- running aquarium boost...", format_elapsed(session_start.elapsed()));
             let rod_key = fish_bar_bot::settings::key_for_slot(settings.rod_slot).unwrap_or(Key::Num1);
             aquarium::run_aquarium_boost(rod_key);
@@ -676,9 +694,9 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let Some(totem_key) = totem_preference
-            && total_casts >= TOTEM_START_CAST
-            && (total_casts - TOTEM_START_CAST) % TOTEM_INTERVAL == 0
+            && last_totem_refresh.elapsed() >= TOTEM_REFRESH_INTERVAL
         {
+            last_totem_refresh = Instant::now();
             let rod_key = fish_bar_bot::settings::key_for_slot(settings.rod_slot).unwrap_or(Key::Num1);
             run_totem_action(&monitor, totem_key, rod_key);
             press_pre_trigger_keys();
