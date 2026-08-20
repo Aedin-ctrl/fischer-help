@@ -177,7 +177,7 @@ const ENTER_COUNT_OVERRIDE: Option<u32> = Some(0);
 // per loop iteration, right before the next cast (never mid-fight), so if
 // one fires while a long fight is still in progress, it just runs before
 // the next cast starts rather than interrupting anything.
-const DAY_NIGHT_CHECK_INTERVAL: Duration = Duration::from_secs(13 * 60);
+const DAY_NIGHT_CHECK_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const AQUARIUM_BOOST_INTERVAL: Duration = Duration::from_secs(31 * 60);
 const TOTEM_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
