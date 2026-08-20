@@ -408,15 +408,6 @@ const MISSING_GRACE: Duration = Duration::from_millis(1200);
 /// Consecutive ticks bar+pin must both be detected together before it's
 /// trusted as a real bite rather than a single-frame false positive.
 const CONFIRM_STREAK_REQUIRED: u32 = 4;
-/// Consecutive ticks a zone crossing (release <-> hold) must hold before
-/// the key is actually pressed/released -- filters a single noisy frame
-/// from flipping the key on bar-edge measurement jitter.
-const ZONE_CHANGE_CONFIRM_TICKS: u32 = 2;
-/// Exponential-smoothing factor applied to the bar's measured left/right
-/// edges before computing the zone thresholds -- 1.0 would mean no
-/// smoothing (trust each raw frame fully), lower values weight recent
-/// history more heavily.
-const SMOOTHING_ALPHA: f64 = 0.35;
 
 /// Measured directly against this skin's real bar position (top-left
 /// 441,795 to bottom-right 1001,817) -- close to what calibration::region()
@@ -441,25 +432,6 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
     let mut confirm_streak = 0u32;
     let mut missing_since: Option<Instant> = None;
     let session_start = Instant::now();
-    // A crossing into a new zone (release/hold) has to hold for
-    // ZONE_CHANGE_CONFIRM_TICKS consecutive ticks before it's acted on --
-    // the bar's measured edges jitter frame to frame (observed swings of
-    // 50-100px between consecutive reads on a bar that wasn't actually
-    // moving that much), so release_edge/hold_edge computed fresh each
-    // tick can occasionally misclassify a single noisy frame, triggering
-    // a real but spurious press.
-    let mut pending_heading: Option<Side> = None;
-    let mut pending_streak = 0u32;
-    // Smoothed bar edges, used for the zone-crossing decision instead of
-    // the raw per-frame measurement -- real capture data showed the bar's
-    // measured width swinging wildly frame to frame (e.g. ~400px down to
-    // 42-77px on a bar that wasn't actually moving that much). Reacting to
-    // that raw noise miscomputes release_edge/hold_edge and can trigger a
-    // real (2-tick-confirmed) wrong-direction press, which only becomes
-    // likely to actually happen over a long sustained fight -- short ones
-    // don't run enough ticks to hit a bad enough frame.
-    let mut smoothed_bar_left = 0.0f64;
-    let mut smoothed_bar_right = 0.0f64;
     // TEMPORARY: dumps a full-width color profile once per cast, on the
     // very first captured frame, now that the region itself is fixed --
     // needed for one fresh calibration pass against the CORRECT patch of
@@ -501,12 +473,6 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
             (Some(bar), Some(pin)) => {
                 missing_since = None;
                 if confirm_streak == 0 {
-                    // First frame of a new streak -- snap the smoothed
-                    // edges straight to the raw reading instead of easing
-                    // in, so tracking doesn't start with a stale/zeroed
-                    // bar position.
-                    smoothed_bar_left = bar.left;
-                    smoothed_bar_right = bar.right;
                     // Permanent (non-overwritten) log of exactly what got
                     // detected at the start of a streak -- the \r status
                     // line below gets erased before a human can read it if
@@ -519,9 +485,6 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
                         bar.right - bar.left,
                         pin.center
                     );
-                } else {
-                    smoothed_bar_left = SMOOTHING_ALPHA * bar.left + (1.0 - SMOOTHING_ALPHA) * smoothed_bar_left;
-                    smoothed_bar_right = SMOOTHING_ALPHA * bar.right + (1.0 - SMOOTHING_ALPHA) * smoothed_bar_right;
                 }
                 confirm_streak += 1;
                 if confirm_streak == CONFIRM_STREAK_REQUIRED {
@@ -530,10 +493,16 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
                 if confirm_streak >= CONFIRM_STREAK_REQUIRED {
                     ever_confirmed = true;
                 }
-                let bar_width = smoothed_bar_right - smoothed_bar_left;
+                // Fresh, immediate decision every single frame -- the pin
+                // moves fast as real gameplay, not sensor noise, so react
+                // to exactly where it is right now rather than smoothing
+                // or requiring a crossing to persist across frames (both
+                // of those just make the response lag behind the pin's
+                // actual current position).
+                let bar_width = bar.right - bar.left;
                 if bar_width > 0.0 {
-                    let release_edge = smoothed_bar_left + RELEASE_FRACTION * bar_width;
-                    let hold_edge = smoothed_bar_right - HOLD_FRACTION * bar_width;
+                    let release_edge = bar.left + RELEASE_FRACTION * bar_width;
+                    let hold_edge = bar.right - HOLD_FRACTION * bar_width;
                     let new_heading = if pin.center >= hold_edge {
                         Side::Right
                     } else if pin.center <= release_edge {
@@ -541,28 +510,16 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
                     } else {
                         heading // middle 1/5 -- leave heading as-is
                     };
-                    if new_heading == heading {
-                        pending_heading = None;
-                        pending_streak = 0;
-                    } else if pending_heading == Some(new_heading) {
-                        pending_streak += 1;
-                        if pending_streak >= ZONE_CHANGE_CONFIRM_TICKS {
-                            // set_heading() calls key_down/key_up, each of
-                            // which fires a brand-new synthetic key event --
-                            // calling it every tick even while the heading
-                            // hasn't changed spams repeated KeyPress events
-                            // instead of one continuous hold, which the
-                            // game reads as rapid clicking rather than
-                            // holding the key down. Only call it once the
-                            // crossing is confirmed.
-                            heading = new_heading;
-                            set_heading(heading);
-                            pending_heading = None;
-                            pending_streak = 0;
-                        }
-                    } else {
-                        pending_heading = Some(new_heading);
-                        pending_streak = 1;
+                    // set_heading() calls key_down/key_up, each of which
+                    // fires a brand-new synthetic key event -- calling it
+                    // every tick even while the heading hasn't changed
+                    // spams repeated KeyPress events instead of one
+                    // continuous hold, which the game reads as rapid
+                    // clicking rather than holding the key down. Only
+                    // call it on an actual transition.
+                    if new_heading != heading {
+                        heading = new_heading;
+                        set_heading(heading);
                     }
                 }
                 print_status(&format!(
