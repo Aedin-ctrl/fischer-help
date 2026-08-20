@@ -391,12 +391,24 @@ enum ControlOutcome {
 const POLL_INTERVAL: Duration = Duration::from_millis(30);
 /// Fraction of the bar's own width, measured in from the left edge, that
 /// counts as "release" -- pin anywhere in here means let go and drift left.
-const RELEASE_FRACTION: f64 = 0.4;
+/// Sevenths rather than fifths -- same split (3/7 release, 1/7 deadzone,
+/// 3/7 hold), just a wider margin before a crossing registers at all.
+const RELEASE_FRACTION: f64 = 3.0 / 7.0;
 /// Fraction of the bar's own width, measured in from the right edge, that
 /// counts as "hold" -- pin anywhere in here means push right. Together
-/// with RELEASE_FRACTION this leaves the middle 1/5 of the bar as a
+/// with RELEASE_FRACTION this leaves the middle 1/7 of the bar as a
 /// deadzone where the heading is left unchanged.
-const HOLD_FRACTION: f64 = 0.4;
+const HOLD_FRACTION: f64 = 3.0 / 7.0;
+/// Consecutive ticks a zone crossing must be seen on before it's acted on.
+/// The bar detector occasionally finds a spurious, wrong-shaped blob for a
+/// single frame even while the true bar is stable -- without this, that
+/// one bad frame alone was enough to drop a hold that should have stayed
+/// locked, producing rapid click/release cycling instead of a steady hold
+/// even while the pin sat solidly in the hold zone the whole time. This
+/// only adds delay right at a genuine transition, not continuously (unlike
+/// smoothing the bar's position, which was tried and reverted for exactly
+/// that reason).
+const ZONE_CHANGE_CONFIRM_TICKS: u32 = 2;
 /// How long bar AND pin must both stay undetected (after having been
 /// confirmed together for CONFIRM_STREAK_REQUIRED ticks) before the fight
 /// is considered over. Real capture data showed the detector legitimately
@@ -432,6 +444,11 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
     let mut confirm_streak = 0u32;
     let mut missing_since: Option<Instant> = None;
     let session_start = Instant::now();
+    // A crossing into the opposite zone has to be seen on
+    // ZONE_CHANGE_CONFIRM_TICKS consecutive frames before it's acted on --
+    // see the constant's doc comment.
+    let mut pending_heading: Option<Side> = None;
+    let mut pending_streak = 0u32;
     // TEMPORARY: dumps a full-width color profile once per cast, on the
     // very first captured frame, now that the region itself is fixed --
     // needed for one fresh calibration pass against the CORRECT patch of
@@ -493,12 +510,13 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
                 if confirm_streak >= CONFIRM_STREAK_REQUIRED {
                     ever_confirmed = true;
                 }
-                // Fresh, immediate decision every single frame -- the pin
-                // moves fast as real gameplay, not sensor noise, so react
-                // to exactly where it is right now rather than smoothing
-                // or requiring a crossing to persist across frames (both
-                // of those just make the response lag behind the pin's
-                // actual current position).
+                // Decision uses the raw bar/pin reading every frame (the
+                // pin moves fast as real gameplay, not sensor noise, so we
+                // want to see exactly where it is right now) -- but a
+                // crossing into the opposite zone only gets acted on once
+                // it's held for ZONE_CHANGE_CONFIRM_TICKS frames, so a
+                // single spurious bad-bar-detection frame can't drop a
+                // hold (or trigger one) that should have stayed locked.
                 let bar_width = bar.right - bar.left;
                 if bar_width > 0.0 {
                     let release_edge = bar.left + RELEASE_FRACTION * bar_width;
@@ -508,18 +526,30 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
                     } else if pin.center <= release_edge {
                         Side::Left
                     } else {
-                        heading // middle 1/5 -- leave heading as-is
+                        heading // middle 1/7 -- leave heading as-is
                     };
-                    // set_heading() calls key_down/key_up, each of which
-                    // fires a brand-new synthetic key event -- calling it
-                    // every tick even while the heading hasn't changed
-                    // spams repeated KeyPress events instead of one
-                    // continuous hold, which the game reads as rapid
-                    // clicking rather than holding the key down. Only
-                    // call it on an actual transition.
-                    if new_heading != heading {
-                        heading = new_heading;
-                        set_heading(heading);
+                    if new_heading == heading {
+                        pending_heading = None;
+                        pending_streak = 0;
+                    } else if pending_heading == Some(new_heading) {
+                        pending_streak += 1;
+                        if pending_streak >= ZONE_CHANGE_CONFIRM_TICKS {
+                            // set_heading() calls key_down/key_up, each of
+                            // which fires a brand-new synthetic key event --
+                            // calling it every tick even while the heading
+                            // hasn't changed spams repeated KeyPress events
+                            // instead of one continuous hold, which the
+                            // game reads as rapid clicking rather than
+                            // holding the key down. Only call it once the
+                            // crossing is confirmed.
+                            heading = new_heading;
+                            set_heading(heading);
+                            pending_heading = None;
+                            pending_streak = 0;
+                        }
+                    } else {
+                        pending_heading = Some(new_heading);
+                        pending_streak = 1;
                     }
                 }
                 print_status(&format!(
