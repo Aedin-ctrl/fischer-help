@@ -273,13 +273,15 @@ const DEFAULT_NO_BITE_TIMEOUT_SECS: u64 = 20;
 /// Stop the whole program after this many no-bite timeouts in a row.
 const NO_BITE_TIMEOUT_STOP_LIMIT: u32 = 3;
 
-/// Which half of the bar the pin is currently in -- see the doc comment
+/// Which seventh of the bar the pin is currently in -- see the doc comment
 /// above run_pin_tracking_control() for what each one does.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Zone {
-    /// At or left of the bar's center -- do nothing at all, key stays up.
+    /// First 3/7 of the bar -- do nothing at all, key stays up.
     Release,
-    /// Right of the bar's center -- hold the key down.
+    /// Center 1/7 -- slow tap-tracking, not a sustained hold.
+    Middle,
+    /// Last 3/7 -- hold the key down, don't let go until the pin leaves.
     Hold,
 }
 
@@ -351,23 +353,26 @@ enum ControlOutcome {
 // PIN-TRACKING CONTROL LOOP — replaces the 5-point flash approach
 // ----------------------------------------------------------------------
 //
-// Every tick: find the bar's x-bounds and the pin's x-position, and act on
-// exactly where the pin is RIGHT NOW relative to the bar's own center --
-// no deadzone, no smoothing, no debounce, no tapping. An instant switch
-// the moment it crosses the center (see Zone above):
-//   - Release (at/left of center): do nothing at all -- key stays up, the
-//     bar drifts left on its own.
-//   - Hold (right of center): hold the key down, and don't let go until
-//     the pin actually crosses back over the center on a later frame -- a
-//     single bad detection frame can't drop it, since the zone only
-//     changes in response to a fresh reading, never a timer.
+// Every tick: find the bar's x-bounds and the pin's x-position, split the
+// bar's OWN span into sevenths, and act on exactly where the pin is RIGHT
+// NOW -- no smoothing, no debounce, an instant switch the moment it
+// crosses into a different zone (see Zone above):
+//   - Release (first 3/7): do nothing at all -- key stays up, the bar
+//     drifts left on its own.
+//   - Hold (last 3/7): hold the key down, and don't let go until the pin
+//     actually leaves this zone on a later frame -- a single bad
+//     detection frame can't drop it, since the zone only changes in
+//     response to a fresh reading, never a timer.
+//   - Middle (center 1/7): slow tap-tracking -- a brief tap every
+//     MIDDLE_TAP_INTERVAL rather than a sustained hold, since holding
+//     continuously in such a narrow band would overshoot straight through
+//     it into the hold zone.
 //
 // Confirmed from real play: when the bar first appears there's a brief
 // grace period where both the bar and the pin sit locked at a fixed
 // position (pin roughly centered) before control is handed over -- no
-// special-casing needed, since the tiny detection noise around dead-center
-// just flips the zone back and forth harmlessly until real movement
-// begins.
+// special-casing needed, since the pin naturally lands in the middle 1/7
+// during it.
 //
 // The small decorative icon in the middle of the bar (visible only while
 // NOT holding -- it appears and disappears along with the key state) is
@@ -393,6 +398,23 @@ enum ControlOutcome {
 // enough to arm the fight-over/no-bite-timeout logic" is.
 
 const POLL_INTERVAL: Duration = Duration::from_millis(30);
+/// Fraction of the bar's own width, from the left edge, that counts as
+/// Zone::Release.
+const RELEASE_FRACTION: f64 = 3.0 / 7.0;
+/// Fraction of the bar's own width, from the right edge, that counts as
+/// Zone::Hold. Together with RELEASE_FRACTION this leaves the middle 1/7
+/// as Zone::Middle.
+const HOLD_FRACTION: f64 = 3.0 / 7.0;
+/// How long to wait (measured from the end of the previous tap) before the
+/// next tap while the pin sits in Zone::Middle -- faster than the initial
+/// 200ms, since with MIDDLE_TAP_HOLD longer than this interval, taps end
+/// up firing back-to-back anyway (each tap's own hold time already covers
+/// most of the gap), giving something close to a trickle-hold rather than
+/// isolated clicks.
+const MIDDLE_TAP_INTERVAL: Duration = Duration::from_millis(100);
+/// Length of each tap while tracking in Zone::Middle -- 0.1s longer than
+/// the initial 50ms.
+const MIDDLE_TAP_HOLD: Duration = Duration::from_millis(150);
 /// How long bar AND pin must both stay undetected (after having been
 /// confirmed together for CONFIRM_STREAK_REQUIRED ticks) before the fight
 /// is considered over. Real capture data showed the detector legitimately
@@ -425,6 +447,7 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
     // No zone yet, no key held -- matches the real key state, since
     // whatever ended the previous fight already released it.
     let mut current_zone: Option<Zone> = None;
+    let mut last_middle_tap: Option<Instant> = None;
     let mut ever_confirmed = false;
     let mut confirm_streak = 0u32;
     let mut missing_since: Option<Instant> = None;
@@ -491,27 +514,49 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
                     ever_confirmed = true;
                 }
                 // Fresh, immediate decision every single frame -- exactly
-                // where the pin is right now, relative to the bar's own
-                // center. bar.center comes straight from vision::Bounds.
-                let zone = if pin.center > bar.center { Zone::Hold } else { Zone::Release };
+                // where the pin is right now, split against the bar's own
+                // width into sevenths.
+                let bar_width = bar.right - bar.left;
+                if bar_width > 0.0 {
+                    let release_edge = bar.left + RELEASE_FRACTION * bar_width;
+                    let hold_edge = bar.right - HOLD_FRACTION * bar_width;
+                    let zone = if pin.center <= release_edge {
+                        Zone::Release
+                    } else if pin.center >= hold_edge {
+                        Zone::Hold
+                    } else {
+                        Zone::Middle
+                    };
 
-                if Some(zone) != current_zone {
-                    // key_down/key_up each fire a brand-new synthetic key
-                    // event -- only call them right on the transition into
-                    // a new zone, not every tick, otherwise a sustained
-                    // Hold spams repeated KeyPress events instead of one
-                    // continuous hold.
-                    match zone {
-                        Zone::Release => input::key_up(config::HOLD_KEY),
-                        Zone::Hold => input::key_down(config::HOLD_KEY),
+                    if Some(zone) != current_zone {
+                        // key_down/key_up each fire a brand-new synthetic
+                        // key event -- only call them right on the
+                        // transition into a new zone, not every tick,
+                        // otherwise a sustained Hold spams repeated
+                        // KeyPress events instead of one continuous hold.
+                        match zone {
+                            Zone::Release | Zone::Middle => input::key_up(config::HOLD_KEY),
+                            Zone::Hold => input::key_down(config::HOLD_KEY),
+                        }
+                        current_zone = Some(zone);
+                        if zone == Zone::Middle {
+                            last_middle_tap = None; // tap immediately on entry
+                        }
                     }
-                    current_zone = Some(zone);
-                }
 
-                print_status(&format!(
-                    "[track] bar={:.0}-{:.0} pin={:.0} zone={zone:?} streak={confirm_streak}",
-                    bar.left, bar.right, pin.center
-                ));
+                    if zone == Zone::Middle {
+                        let ready = last_middle_tap.map_or(true, |t| t.elapsed() >= MIDDLE_TAP_INTERVAL);
+                        if ready {
+                            input::tap_key(config::HOLD_KEY, MIDDLE_TAP_HOLD);
+                            last_middle_tap = Some(Instant::now());
+                        }
+                    }
+
+                    print_status(&format!(
+                        "[track] bar={:.0}-{:.0} pin={:.0} zone={zone:?} streak={confirm_streak}",
+                        bar.left, bar.right, pin.center
+                    ));
+                }
             }
             _ => {
                 confirm_streak = 0;
@@ -802,32 +847,47 @@ mod tests {
                 }
             }
 
-            // Zone decision: split the TRUE bar span at its own center,
-            // same as run_pin_tracking_control -- pin right of center ->
-            // Hold, at/left of center -> Release. Assert with a little
-            // slack around the center for detection rounding.
-            let true_bar_center = (bar_left + bar_right) as f64 / 2.0;
+            // Zone decision: split the TRUE bar span into sevenths, same
+            // as run_pin_tracking_control -- pin in the first 3/7 ->
+            // Release, last 3/7 -> Hold, middle 1/7 -> Middle. Assert with
+            // a little slack around each boundary for detection rounding.
+            let bar_width_true = (bar_right - bar_left) as f64;
+            let release_edge = bar_left as f64 + RELEASE_FRACTION * bar_width_true;
+            let hold_edge = bar_right as f64 - HOLD_FRACTION * bar_width_true;
             let slack = 6.0;
 
-            let expected_zone = if true_pin_center > true_bar_center + slack {
-                Some(Zone::Hold)
-            } else if true_pin_center < true_bar_center - slack {
+            let expected_zone = if true_pin_center <= release_edge - slack {
                 Some(Zone::Release)
+            } else if true_pin_center >= hold_edge + slack {
+                Some(Zone::Hold)
+            } else if true_pin_center >= release_edge + slack && true_pin_center <= hold_edge - slack {
+                Some(Zone::Middle)
             } else {
-                None // too close to center to have a deterministic expectation
+                None // too close to a boundary to have a deterministic expectation
             };
 
             if let Some(expected) = expected_zone {
                 zone_total += 1;
                 let actual = match (detected_bar, detected_pin) {
-                    (Some(b), Some(p)) => Some(if p.center > b.center { Zone::Hold } else { Zone::Release }),
+                    (Some(b), Some(p)) => {
+                        let w = b.right - b.left;
+                        let re = b.left + RELEASE_FRACTION * w;
+                        let he = b.right - HOLD_FRACTION * w;
+                        if p.center <= re {
+                            Some(Zone::Release)
+                        } else if p.center >= he {
+                            Some(Zone::Hold)
+                        } else {
+                            Some(Zone::Middle)
+                        }
+                    }
                     _ => None,
                 };
 
                 match actual {
                     Some(a) if a == expected => zone_ok += 1,
                     _ => eprintln!(
-                        "FAIL[zone #{i}]: expected={expected:?} actual={actual:?} true_pin={true_pin_center:.1} true_bar_center={true_bar_center:.1}"
+                        "FAIL[zone #{i}]: expected={expected:?} actual={actual:?} true_pin={true_pin_center:.1} release_edge={release_edge:.1} hold_edge={hold_edge:.1}"
                     ),
                 }
             }
