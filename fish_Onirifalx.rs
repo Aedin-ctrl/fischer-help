@@ -405,10 +405,16 @@ const RELEASE_FRACTION: f64 = 3.0 / 7.0;
 /// Zone::Hold. Together with RELEASE_FRACTION this leaves the middle 1/7
 /// as Zone::Middle.
 const HOLD_FRACTION: f64 = 3.0 / 7.0;
-/// How often to tap (not hold) while the pin sits in Zone::Middle.
-const MIDDLE_TAP_INTERVAL: Duration = Duration::from_millis(200);
-/// Length of each tap while tracking in Zone::Middle.
-const MIDDLE_TAP_HOLD: Duration = Duration::from_millis(50);
+/// How long to wait (measured from the end of the previous tap) before the
+/// next tap while the pin sits in Zone::Middle -- faster than the initial
+/// 200ms, since with MIDDLE_TAP_HOLD longer than this interval, taps end
+/// up firing back-to-back anyway (each tap's own hold time already covers
+/// most of the gap), giving something close to a trickle-hold rather than
+/// isolated clicks.
+const MIDDLE_TAP_INTERVAL: Duration = Duration::from_millis(100);
+/// Length of each tap while tracking in Zone::Middle -- 0.1s longer than
+/// the initial 50ms.
+const MIDDLE_TAP_HOLD: Duration = Duration::from_millis(150);
 /// How long bar AND pin must both stay undetected (after having been
 /// confirmed together for CONFIRM_STREAK_REQUIRED ticks) before the fight
 /// is considered over. Real capture data showed the detector legitimately
