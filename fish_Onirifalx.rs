@@ -24,7 +24,7 @@ use rdev::Key;
 use xcap::Monitor;
 
 use fish_bar_bot::config::HsvRange;
-use fish_bar_bot::{aquarium, calibration, capture, config, control, input, vision};
+use fish_bar_bot::{aquarium, capture, config, control, input, vision};
 
 /// Extra Enter presses tacked on after each normal cast sequence, on top of
 /// run_trigger_sequence's own burst.
@@ -413,10 +413,19 @@ const CONFIRM_STREAK_REQUIRED: u32 = 4;
 /// from flipping the key on bar-edge measurement jitter.
 const ZONE_CHANGE_CONFIRM_TICKS: u32 = 2;
 
+/// Measured directly against this skin's real bar position (top-left
+/// 351,726 to bottom-right 816,745) -- calibration::region() was resolving
+/// to left=428 top=791 width=586 height=27, ~65px too low and the wrong
+/// size, meaning every color threshold tuned earlier was calibrated
+/// against whatever's below the real bar, not the bar itself. Hardcoded
+/// here rather than trusting the shared (evidently stale) calibration
+/// data; will need updating if the Roblox window moves or resizes.
+const FIXED_REGION: config::Region = config::Region { left: 351, top: 726, width: 816 - 351, height: 745 - 726 };
+
 fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
     println!("Pin-tracking control engaged (bar + pin color detection)...");
 
-    let region = calibration::region();
+    let region = FIXED_REGION;
     println!(
         "  watching region: left={} top={} width={} height={}",
         region.left, region.top, region.width, region.height
@@ -436,6 +445,13 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
     // a real but spurious press.
     let mut pending_heading: Option<Side> = None;
     let mut pending_streak = 0u32;
+    // TEMPORARY: dumps a full-width color profile once per cast, on the
+    // very first captured frame, now that the region itself is fixed --
+    // needed for one fresh calibration pass against the CORRECT patch of
+    // screen (the color thresholds tuned earlier were reverse-engineered
+    // from the wrong region and are likely meaningless here). Strip once
+    // BAR_HSV_RANGES/PIN_MAX_CHANNEL_VALUE are retuned.
+    let mut profile_printed = false;
 
     loop {
         if !stay_active() {
@@ -448,6 +464,20 @@ fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
             }
             continue;
         };
+
+        if !profile_printed {
+            profile_printed = true;
+            let sample_y = frame.height() / 2;
+            let step = (frame.width() / 24).max(1);
+            let mut profile = String::new();
+            let mut x = 0u32;
+            while x < frame.width() {
+                let p = frame.get_pixel(x, sample_y);
+                profile.push_str(&format!("{x}:({},{},{}) ", p[0], p[1], p[2]));
+                x += step;
+            }
+            println!("\n  [profile] {profile}");
+        }
 
         let bar = find_bar_bounds(&frame);
         let pin = find_pin_bounds(&frame);
