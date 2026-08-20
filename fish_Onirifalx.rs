@@ -414,13 +414,13 @@ const CONFIRM_STREAK_REQUIRED: u32 = 4;
 const ZONE_CHANGE_CONFIRM_TICKS: u32 = 2;
 
 /// Measured directly against this skin's real bar position (top-left
-/// 351,726 to bottom-right 816,745) -- calibration::region() was resolving
-/// to left=428 top=791 width=586 height=27, ~65px too low and the wrong
-/// size, meaning every color threshold tuned earlier was calibrated
-/// against whatever's below the real bar, not the bar itself. Hardcoded
-/// here rather than trusting the shared (evidently stale) calibration
-/// data; will need updating if the Roblox window moves or resizes.
-const FIXED_REGION: config::Region = config::Region { left: 351, top: 726, width: 816 - 351, height: 745 - 726 };
+/// 441,795 to bottom-right 1001,817) -- close to what calibration::region()
+/// was already resolving (left=428 top=791 width=586 height=27), an
+/// earlier measurement of (351,726)-(816,745) turned out to be mistaken.
+/// Hardcoded here rather than trusting the shared calibration data, in
+/// case it needs to diverge again; will need updating if the Roblox
+/// window moves or resizes.
+const FIXED_REGION: config::Region = config::Region { left: 441, top: 795, width: 1001 - 441, height: 817 - 795 };
 
 fn run_pin_tracking_control(no_bite_timeout: Duration) -> ControlOutcome {
     println!("Pin-tracking control engaged (bar + pin color detection)...");
