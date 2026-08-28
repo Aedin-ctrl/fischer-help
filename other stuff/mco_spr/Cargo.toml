@@ -1,0 +1,31 @@
+[package]
+name = "mco_spr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.35.0"
+egui = "0.35.0"
+egui_dnd = "0.16.0"
+global-hotkey = "0.8.0"
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+raw-window-handle = "0.6.2"
+rdev = "0.5.3"
+rfd = "0.17.2"
+syn = { version = "3.0.3", features = ["full"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSGeometry",
+] }
