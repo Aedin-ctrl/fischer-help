@@ -152,6 +152,26 @@ fn prompt_day_night_preference() -> Option<DayNightPref> {
     }
 }
 
+/// A single instantaneous frame can catch the icon mid-animation-dip and
+/// miss it (real captures showed the match score occasionally dropping
+/// below threshold for one frame even while the icon was genuinely on
+/// screen) -- retry for up to ICON_CHECK_RETRY_WINDOW before giving up.
+const ICON_CHECK_RETRY_WINDOW: Duration = Duration::from_millis(500);
+const ICON_CHECK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+fn icon_visible_with_retries(template: Option<&RgbaImage>) -> bool {
+    let start = Instant::now();
+    loop {
+        if control::is_icon_visible(template) {
+            return true;
+        }
+        if input::is_stopped() || start.elapsed() >= ICON_CHECK_RETRY_WINDOW {
+            return false;
+        }
+        thread::sleep(ICON_CHECK_RETRY_INTERVAL);
+    }
+}
+
 // ----------------------------------------------------------------------
 // BANG-BANG CONTROL LOOP — replaces control::run_control_until_gone()
 // ----------------------------------------------------------------------
@@ -171,15 +191,33 @@ fn prompt_day_night_preference() -> Option<DayNightPref> {
 //   back to slow polling. If the full TRANSITION_DURATION elapses with
 //   no flash at all, reverse direction and keep hunting.
 //
-// Throughout, if the bar isn't detected at all (bar_present_count == 0)
-// for longer than BAR_GONE_TIMEOUT (2 full swings there-and-back), the
-// fight is considered over and this function returns so main() can recast.
+// Before the fish ever bites, the bar hasn't appeared on screen yet at
+// all -- that natural wait is unbounded (can easily run 10+ real seconds)
+// and must NOT be mistaken for "fight over." So the give-up rule only
+// arms once we've confirmed a flash at least once this session: from then
+// on, if a full unconfirmed swing cycle (there and back, 2 legs) passes
+// with no re-confirm, the fight is considered over and this function
+// returns so main() can recast. Before that first confirm, we just keep
+// swinging, bounded only by NO_BITE_TIMEOUT as a generous safety net.
 
 const TRANSITION_DURATION: Duration = Duration::from_millis(800);
-const SETTLE_GRACE: Duration = Duration::from_secs(1);
+/// Extra slack tacked onto the end of each leg's flash-watching window.
+/// When the needle sits right at the far edge of the track, the bar only
+/// overlaps it as it reaches the wall -- i.e. right at the tail end of the
+/// nominal 800ms, and capture/physics latency can push the real overlap a
+/// touch past that. Without this buffer, a flash landing just after the
+/// 800ms cutoff gets missed and we reverse right as we were about to catch it.
+const TRANSITION_CONFIRM_BUFFER: Duration = Duration::from_millis(150);
+const SETTLE_GRACE: Duration = Duration::from_millis(150);
 const SETTLED_POLL_INTERVAL: Duration = Duration::from_millis(50);
-/// 2 full A->B->C->D->A cycles, each cycle being two 0.8s legs.
-const BAR_GONE_TIMEOUT: Duration = Duration::from_millis(2 * 2 * 800);
+/// One full there-and-back swing cycle (2 unconfirmed legs) after having
+/// caught the flash at least once before -- that means the fight legitimately
+/// ended (fish caught/escaped/line broke), so give up and recast.
+const LEGS_PER_GIVE_UP: u32 = 2;
+/// Safety net for the case we've NEVER caught a flash yet this session --
+/// covers the natural pre-bite wait (which can genuinely run 10+ seconds),
+/// so this only fires if something is actually broken, not mid-wait.
+const NO_BITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Side {
@@ -218,7 +256,7 @@ fn checked_sleep(duration: Duration) -> bool {
         if input::is_stopped() {
             return false;
         }
-        thread::sleep(Duration::from_millis(20).min(duration - start.elapsed()));
+        thread::sleep(Duration::from_millis(20).min(duration.saturating_sub(start.elapsed())));
     }
     true
 }
@@ -244,7 +282,8 @@ fn run_bang_bang_control() {
 
     let mut side = Side::Left;
     set_heading(side);
-    let mut last_bar_seen = Instant::now();
+    let mut ever_confirmed = false;
+    let session_start = Instant::now();
 
     'outer: loop {
         if !stay_active() {
@@ -262,19 +301,12 @@ fn run_bang_bang_control() {
             };
             let sample = sample_bar(&frame, config::REGION.left, config::REGION.top);
 
-            if sample.bar_present_count > 0 {
-                last_bar_seen = Instant::now();
-            } else if last_bar_seen.elapsed() >= BAR_GONE_TIMEOUT {
-                println!("\nBar not seen for {:.1}s (2 full swings) -- fight over.", BAR_GONE_TIMEOUT.as_secs_f64());
-                input::key_up(config::HOLD_KEY);
-                return;
-            }
-
             print_status(&format!("[settled {side:?}] white={}/5 bar={}/5", sample.white_count, sample.bar_present_count));
 
             if sample.white_count < 2 {
                 break; // lost the flash -- start hunting toward the other side
             }
+            ever_confirmed = true;
             if !checked_sleep(SETTLED_POLL_INTERVAL) {
                 return;
             }
@@ -283,6 +315,7 @@ fn run_bang_bang_control() {
         // -- TRANSITIONING: swing leg by leg until a flash confirms one --
         let mut heading = side.other();
         set_heading(heading);
+        let mut unconfirmed_legs = 0u32;
 
         loop {
             if !stay_active() {
@@ -291,7 +324,7 @@ fn run_bang_bang_control() {
             let leg_start = Instant::now();
             let mut confirmed = false;
 
-            while leg_start.elapsed() < TRANSITION_DURATION {
+            while leg_start.elapsed() < TRANSITION_DURATION + TRANSITION_CONFIRM_BUFFER {
                 if !stay_active() {
                     return;
                 }
@@ -299,14 +332,6 @@ fn run_bang_bang_control() {
                     continue;
                 };
                 let sample = sample_bar(&frame, config::REGION.left, config::REGION.top);
-
-                if sample.bar_present_count > 0 {
-                    last_bar_seen = Instant::now();
-                } else if last_bar_seen.elapsed() >= BAR_GONE_TIMEOUT {
-                    println!("\nBar not seen for {:.1}s (2 full swings) -- fight over.", BAR_GONE_TIMEOUT.as_secs_f64());
-                    input::key_up(config::HOLD_KEY);
-                    return;
-                }
 
                 print_status(&format!(
                     "[transit -> {heading:?}] white={}/5 bar={}/5 {}",
@@ -321,8 +346,22 @@ fn run_bang_bang_control() {
             }
 
             if confirmed {
+                ever_confirmed = true;
                 side = heading;
                 break;
+            }
+
+            unconfirmed_legs += 1;
+
+            if ever_confirmed && unconfirmed_legs >= LEGS_PER_GIVE_UP {
+                println!("\nNo flash for a full swing cycle after catching it before -- fight over.");
+                input::key_up(config::HOLD_KEY);
+                return;
+            }
+            if !ever_confirmed && session_start.elapsed() >= NO_BITE_TIMEOUT {
+                println!("\nNo bite within {:.0}s -- recasting anyway.", NO_BITE_TIMEOUT.as_secs_f64());
+                input::key_up(config::HOLD_KEY);
+                return;
             }
 
             // No flash this whole leg -- reverse and keep hunting.
@@ -340,6 +379,16 @@ fn run_bang_bang_control() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Safety net: if anything panics anywhere in the loop below, release the
+    // held key before unwinding -- otherwise a crash mid-hold leaves Space
+    // stuck down in-game forever (this is what caused the "stuck jumping"
+    // bug: a panic unwound straight past the key_up() at the bottom of main).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        input::key_up(Key::Space);
+        default_hook(info);
+    }));
+
     let day_night_preference = prompt_day_night_preference();
 
     for i in (1..=3).rev() {
@@ -382,14 +431,17 @@ fn main() -> anyhow::Result<()> {
 
         if day_night_preference.is_some() && session_count >= config::SESSIONS_BETWEEN_MOON_CHECKS {
             session_count = 0;
-            if control::is_icon_visible(watch_template.as_ref()) {
-                control::run_moon_action(&monitor);
+            if icon_visible_with_retries(watch_template.as_ref()) {
+                let settings = fish_bar_bot::settings::load();
+                let totem_key = fish_bar_bot::settings::key_for_slot(settings.skip_day_night_where).unwrap_or(Key::Num5);
+                let rod_key = fish_bar_bot::settings::key_for_slot(settings.rod_slot).unwrap_or(Key::Num1);
+                control::run_moon_action(&monitor, totem_key, rod_key);
             }
             // Full delay before the cast either way.
             thread::sleep(config::MOON_CHECK_PRE_CAST_DELAY);
         }
 
-        control::run_trigger_sequence();
+        control::run_trigger_sequence(false, None);
         if input::is_stopped() {
             break;
         }

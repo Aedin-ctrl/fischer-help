@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 moon_test_capture.png
+/target
+fish_bar_rust/target
+other stuff/mco_spr/target

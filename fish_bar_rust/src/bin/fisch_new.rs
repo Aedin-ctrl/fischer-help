@@ -1,7 +1,11 @@
-//! Autonomous Bar Bot (macOS, terminal) — same as main.rs, but the
-//! reactive control-bar/needle tracking loop (control::run_control_until_gone)
-//! is replaced with a 5-point white-flash bang-bang controller — see
-//! run_bang_bang_control() below.
+//! Autonomous Bar Bot (macOS, terminal) — same as main.rs, plus rod-reset/
+//! re-seat/totems/skip-day-night orchestration driven by settings.toml.
+//! Tracking now uses control::run_predictive_control_until_gone() (see
+//! that function's doc comment for the physics model) instead of this
+//! file's original 5-point white-flash bang-bang controller. The
+//! bang-bang code (run_bang_bang_control() and everything it uses) is
+//! kept below, unused, as a fallback/reference rather than deleted —
+//! hence the file-level dead_code allow.
 //!
 //! macOS: grant Screen Recording + Accessibility to your terminal app in
 //! System Settings -> Privacy & Security, then restart the terminal.
@@ -11,36 +15,38 @@
 //! F8  = pause/resume the whole loop (safe to hit anytime)
 //! ESC = quit immediately (always releases the mouse/key first)
 
+#![allow(dead_code)]
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use image::RgbaImage;
-use rdev::Key;
+use rdev::{Button, Key};
+use xcap::Monitor;
 
 use fish_bar_bot::config::HsvRange;
-use fish_bar_bot::{capture, config, control, input};
+use fish_bar_bot::{calibration, capture, config, control, input};
 
 // ----------------------------------------------------------------------
 // 5-POINT BAR SAMPLING
 // ----------------------------------------------------------------------
 //
-// Five fixed x-positions along the control-bar track (absolute screen
-// coordinates, same y), ordered far-right to far-left. The bar occupies
-// ~55% of the track's width, and these five points were picked so that
-// wherever the bar currently sits, at least two of them fall under it —
-// so we never need to track the bar's actual edges, just sample these
-// fixed spots.
-const SAMPLE_POINTS_X: [i32; 5] = [994, 784, 721, 660, 445];
-const SAMPLE_Y: i32 = 805;
-
-// The bar's own color is a whole-bar state, not per-pixel: it reads
-// bright/white when the needle is currently aligned with it ("engaged"),
-// and dim/brown when it isn't. Reuse the same two ranges main.rs's
-// tracker uses for "the bar" as a whole.
-const WHITE_RANGE: HsvRange = config::CONTROLLED_BAR_HSV_RANGES[0];
-const BAR_RANGES: &[HsvRange] = config::CONTROLLED_BAR_HSV_RANGES;
+// Five fixed x-positions along the control-bar track (same y), ordered
+// far-right to far-left. The bar occupies ~55% of the track's width, and
+// these five points were picked so that wherever the bar currently sits,
+// at least two of them fall under it — so we never need to track the
+// bar's actual edges, just sample these fixed spots.
+//
+// Stored as fractions of the region (not absolute pixels) so they still
+// land on the bar regardless of device/resolution — resolved against
+// calibration::region() at runtime instead. These fractions are just the
+// original absolute values (994, 784, 721, 660, 445, y=805) divided
+// against the old hardcoded config::REGION (426, 785, 589x35); no new
+// calibration data needed since the ratios don't change.
+const SAMPLE_POINTS_X_FRAC: [f64; 5] = [0.964346, 0.607810, 0.500849, 0.397284, 0.032258];
+const SAMPLE_Y_FRAC: f64 = 0.571429;
 
 fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let (rf, gf, bf) = (r as f64, g as f64, b as f64);
@@ -105,51 +111,77 @@ struct BarSample {
     bar_present_count: u32,
 }
 
-fn sample_bar(frame: &RgbaImage, region_left: i32, region_top: i32) -> BarSample {
+fn sample_bar(frame: &RgbaImage, region: config::Region, white_range: HsvRange, bar_ranges: &[HsvRange]) -> BarSample {
     let mut white_count = 0;
     let mut bar_present_count = 0;
-    for &x_abs in &SAMPLE_POINTS_X {
-        let cx = x_abs - region_left;
-        let cy = SAMPLE_Y - region_top;
-        if point_matches(frame, cx, cy, std::slice::from_ref(&WHITE_RANGE)) {
+    let cy = (SAMPLE_Y_FRAC * region.height as f64).round() as i32;
+    for &frac_x in &SAMPLE_POINTS_X_FRAC {
+        let cx = (frac_x * region.width as f64).round() as i32;
+        if point_matches(frame, cx, cy, std::slice::from_ref(&white_range)) {
             white_count += 1;
         }
-        if point_matches(frame, cx, cy, BAR_RANGES) {
+        if point_matches(frame, cx, cy, bar_ranges) {
             bar_present_count += 1;
         }
     }
     BarSample { white_count, bar_present_count }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum DayNightPref {
-    Day,
-    Night,
+const RESEAT_SPACE_HOLD: Duration = Duration::from_millis(120);
+const RESEAT_POST_SPACE_DELAY: Duration = Duration::from_millis(800);
+const RESEAT_E_HOLD: Duration = Duration::from_millis(500);
+
+/// Taps space, waits, then holds 'e' briefly. Independent of rod-reset --
+/// doesn't touch the rod slot at all.
+fn run_reseat_action() {
+    println!("\nRe-seating: space, then holding 'e'...");
+    if input::is_stopped() {
+        return;
+    }
+    input::tap_key(Key::Space, RESEAT_SPACE_HOLD);
+    thread::sleep(RESEAT_POST_SPACE_DELAY);
+
+    if input::is_stopped() {
+        return;
+    }
+    input::tap_key(Key::KeyE, RESEAT_E_HOLD);
 }
 
-/// Ask which time of day to skip. 'd'/'day' watches for the sun icon (day)
-/// and skips it -- net effect: only night. 'n'/'night' watches for the moon
-/// icon (night) instead -- net effect: only day. Anything else (including
-/// just Enter) disables the check entirely.
-fn prompt_day_night_preference() -> Option<DayNightPref> {
-    print!("What do you want to skip? Type d/day to skip day, n/night to skip night, or press Enter to skip nothing: ");
-    let _ = io::stdout().flush();
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer).ok();
-    match answer.trim().to_lowercase().as_str() {
-        "d" | "day" => {
-            println!("okay, skipping day whenever it's detected");
-            Some(DayNightPref::Day)
+/// Presses the configured rod-reset slot, then the rod slot -- the same
+/// lead-in the normal cast sequence does itself. Run this standalone,
+/// then call control::run_trigger_sequence(true) so the cast doesn't
+/// press them again on top of this.
+fn run_rod_reset_action(reset_key: Key, rod_key: Key) {
+    println!("\nRod-reset: pressing reset slot, then rod slot...");
+    for key in [reset_key, rod_key] {
+        if input::is_stopped() {
+            return;
         }
-        "n" | "night" => {
-            println!("okay, skipping night whenever it's detected");
-            Some(DayNightPref::Night)
-        }
-        _ => {
-            println!("alright, skipping nothing — day/night check disabled");
-            None
-        }
+        input::tap_key(key, config::PRE_TRIGGER_KEY_HOLD);
+        thread::sleep(config::PRE_TRIGGER_KEY_DELAY);
     }
+}
+
+const TOTEM_KEY_HOLD: Duration = Duration::from_millis(120);
+const TOTEM_SWITCH_DELAY: Duration = Duration::from_millis(300);
+const TOTEM_CLICK_HOLD: Duration = Duration::from_millis(200);
+
+/// Presses the totem slot, clicks screen center (places/refreshes it),
+/// then switches back to the rod slot. No detection -- just the sequence.
+fn run_totem_action(monitor: &Monitor, totem_key: Key, rod_key: Key) {
+    println!("\nRefreshing totem: pressing totem slot, clicking center, switching back to rod slot...");
+    input::tap_key(totem_key, TOTEM_KEY_HOLD);
+    thread::sleep(TOTEM_SWITCH_DELAY);
+
+    let center_x = monitor.x().unwrap_or(0) + monitor.width().unwrap_or(0) as i32 / 2;
+    let center_y = monitor.y().unwrap_or(0) + monitor.height().unwrap_or(0) as i32 / 2;
+    input::mouse_move(center_x as f64, center_y as f64);
+    input::mouse_down(Button::Left);
+    thread::sleep(TOTEM_CLICK_HOLD);
+    input::mouse_up(Button::Left);
+    thread::sleep(TOTEM_SWITCH_DELAY);
+
+    input::tap_key(rod_key, TOTEM_KEY_HOLD);
 }
 
 /// A single instantaneous frame can catch the icon mid-animation-dip and
@@ -208,7 +240,7 @@ const TRANSITION_DURATION: Duration = Duration::from_millis(800);
 /// touch past that. Without this buffer, a flash landing just after the
 /// 800ms cutoff gets missed and we reverse right as we were about to catch it.
 const TRANSITION_CONFIRM_BUFFER: Duration = Duration::from_millis(150);
-const SETTLE_GRACE: Duration = Duration::from_secs(1);
+const SETTLE_GRACE: Duration = Duration::from_millis(150);
 const SETTLED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// One full there-and-back swing cycle (2 unconfirmed legs) after having
 /// caught the flash at least once before -- that means the fight legitimately
@@ -217,7 +249,7 @@ const LEGS_PER_GIVE_UP: u32 = 2;
 /// Safety net for the case we've NEVER caught a flash yet this session --
 /// covers the natural pre-bite wait (which can genuinely run 10+ seconds),
 /// so this only fires if something is actually broken, not mid-wait.
-const NO_BITE_TIMEOUT: Duration = Duration::from_secs(30);
+const NO_BITE_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Side {
@@ -280,6 +312,15 @@ fn stay_active() -> bool {
 fn run_bang_bang_control() {
     println!("Bang-bang control engaged (5-point white-flash tracking)...");
 
+    let region = calibration::region();
+    let bar_ranges = calibration::bar_hsv_ranges();
+    // Calibration's derived ranges are sorted by hue, not by "which one is
+    // the bright/white one" — unlike config.rs's hand-ordered defaults, so
+    // bar_ranges[0] isn't reliably the white/flash range. Keep that one
+    // tied to the known-correct hardcoded value; only bar presence
+    // (order-independent) comes from calibration.
+    let white_range = config::CONTROLLED_BAR_HSV_RANGES[0];
+
     let mut side = Side::Left;
     set_heading(side);
     let mut ever_confirmed = false;
@@ -295,11 +336,11 @@ fn run_bang_bang_control() {
             if !stay_active() {
                 return;
             }
-            let Ok(frame) = capture::grab_region_normalized(config::REGION) else {
+            let Ok(frame) = capture::grab_region_normalized(region) else {
                 thread::sleep(SETTLED_POLL_INTERVAL);
                 continue;
             };
-            let sample = sample_bar(&frame, config::REGION.left, config::REGION.top);
+            let sample = sample_bar(&frame, region, white_range, bar_ranges);
 
             print_status(&format!("[settled {side:?}] white={}/5 bar={}/5", sample.white_count, sample.bar_present_count));
 
@@ -328,10 +369,10 @@ fn run_bang_bang_control() {
                 if !stay_active() {
                     return;
                 }
-                let Ok(frame) = capture::grab_region_normalized(config::REGION) else {
+                let Ok(frame) = capture::grab_region_normalized(region) else {
                     continue;
                 };
-                let sample = sample_bar(&frame, config::REGION.left, config::REGION.top);
+                let sample = sample_bar(&frame, region, white_range, bar_ranges);
 
                 print_status(&format!(
                     "[transit -> {heading:?}] white={}/5 bar={}/5 {}",
@@ -389,13 +430,32 @@ fn main() -> anyhow::Result<()> {
         default_hook(info);
     }));
 
-    let day_night_preference = prompt_day_night_preference();
+    let settings = fish_bar_bot::settings::load();
+    let rod_key = fish_bar_bot::settings::key_for_slot(settings.rod_slot).unwrap_or(Key::Num1);
+    let rod_reset_where_key = fish_bar_bot::settings::key_for_slot(settings.rod_reset_where).unwrap_or(Key::Num9);
+    let totems_where_key = fish_bar_bot::settings::key_for_slot(settings.totems_where).unwrap_or(Key::Num4);
+    let skip_day_night_where_key = fish_bar_bot::settings::key_for_slot(settings.skip_day_night_where).unwrap_or(Key::Num5);
+    println!(
+        "settings: rod={} rod_reset={} (where={} every {}) skip={:?} (where={} every {}) totems={} (where={} every {}) reseat={} aquarium_boost={} (every {})",
+        settings.rod_slot,
+        settings.rod_reset_enabled,
+        settings.rod_reset_where,
+        settings.rod_reset_count,
+        settings.skip_day_night,
+        settings.skip_day_night_where,
+        settings.skip_day_night_count,
+        settings.use_totems_enabled,
+        settings.totems_where,
+        settings.totems_count,
+        settings.reseat_enabled,
+        settings.aquarium_boost_enabled,
+        settings.aquarium_boost_count,
+    );
 
-    for i in (1..=3).rev() {
-        println!("{i}");
-        thread::sleep(Duration::from_secs(1));
-    }
-
+    // No countdown here anymore -- control_panel shows its own 5s visible
+    // countdown before spawning this process at all, and this process's
+    // own println-based countdown was never actually visible in GUI mode
+    // (stdout has nowhere to go), so it was just a silent extra delay.
     println!("Autonomous bar bot running. F8 = pause/resume, ESC = quit.");
     input::start_hotkey_listener();
 
@@ -415,36 +475,83 @@ fn main() -> anyhow::Result<()> {
     // Only load the one icon template we actually need to watch for -- if
     // skipping nothing, never load either, so the periodic check below
     // never has anything to trigger on.
-    let watch_template = match day_night_preference {
-        Some(DayNightPref::Day) => control::load_icon_template(&asset_dir.join("sun.png"), "sun"),
-        Some(DayNightPref::Night) => control::load_icon_template(&asset_dir.join("moon.png"), "moon"),
+    let watch_template = match settings.skip_day_night {
+        Some(fish_bar_bot::settings::DayNight::Day) => control::load_icon_template(&asset_dir.join("sun.png"), "sun"),
+        Some(fish_bar_bot::settings::DayNight::Night) => control::load_icon_template(&asset_dir.join("moon.png"), "moon"),
         None => None,
     };
 
     let monitor = capture::find_primary_monitor()?;
     let mut session_count: u32 = 0;
+    let mut totem_count: u32 = 0;
+    let mut rod_reset_count: u32 = 0;
+    let mut aquarium_count: u32 = 0;
+    let rod_reset_every = settings.rod_reset_count.max(1);
+    let skip_day_night_every = settings.skip_day_night_count.max(1);
+    let totems_every = settings.totems_count.max(1);
+    let aquarium_every = settings.aquarium_boost_count.max(1);
 
     while !input::is_stopped() {
         if !input::wait_while_paused_or_unfocused() {
             break;
         }
 
-        if day_night_preference.is_some() && session_count >= config::SESSIONS_BETWEEN_MOON_CHECKS {
+        if settings.skip_day_night.is_some() && session_count >= skip_day_night_every {
             session_count = 0;
             if icon_visible_with_retries(watch_template.as_ref()) {
-                control::run_moon_action(&monitor);
+                control::run_moon_action(&monitor, skip_day_night_where_key, rod_key);
             }
             // Full delay before the cast either way.
             thread::sleep(config::MOON_CHECK_PRE_CAST_DELAY);
         }
 
-        control::run_trigger_sequence();
+        if settings.use_totems_enabled && totem_count >= totems_every {
+            totem_count = 0;
+            run_totem_action(&monitor, totems_where_key, rod_key);
+        }
+
+        // Either action already covers the normal cast's own rod-slot
+        // lead-in -- re-seat replaces the need for it, rod-reset presses
+        // it directly -- so skip the cast's built-in press whenever
+        // either one ran.
+        let mut skip_cast_pre_trigger = false;
+
+        if settings.reseat_enabled {
+            run_reseat_action();
+            if input::is_stopped() {
+                break;
+            }
+            skip_cast_pre_trigger = true;
+        }
+
+        if settings.rod_reset_enabled && rod_reset_count >= rod_reset_every {
+            rod_reset_count = 0;
+            run_rod_reset_action(rod_reset_where_key, rod_key);
+            if input::is_stopped() {
+                break;
+            }
+            skip_cast_pre_trigger = true;
+        }
+
+        control::run_trigger_sequence(skip_cast_pre_trigger, None);
         if input::is_stopped() {
             break;
         }
 
-        run_bang_bang_control();
+        // Physics-aware predictive controller (see control.rs) instead of
+        // the old 5-point bang-bang. The bang-bang code below is kept in
+        // place, unused, as a fallback/reference — not deleted — in case
+        // the new one needs more real-world tuning.
+        control::run_predictive_control_until_gone();
         session_count += 1;
+        totem_count += 1;
+        rod_reset_count += 1;
+
+        aquarium_count += 1;
+        if settings.aquarium_boost_enabled && aquarium_count >= aquarium_every {
+            aquarium_count = 0;
+            fish_bar_bot::aquarium::run_aquarium_boost(rod_key);
+        }
 
         let mut slept = Duration::ZERO;
         while slept < config::POST_CHECK_DELAY && !input::is_stopped() {
