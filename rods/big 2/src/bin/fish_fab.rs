@@ -59,7 +59,13 @@ const SAMPLE_Y_FRAC: f64 = 0.571429;
 /// clear of the actual dim/brown "pin not on it" state (V50-100, see
 /// CONTROLLED_BAR_HSV_RANGES[1]) by 140+ points -- so this range widens S
 /// generously and leans on V alone to keep excluding that real dim state.
-const PINK_SKIN_WHITE_RANGE: HsvRange = ((0, 0, 170), (180, 100, 255));
+/// V floor is 220, not just above the dim ceiling: pale rest and shimmer
+/// are close to each other (both V241-250) and both far from the dim
+/// state, so there's no need for a cautious middle-ground floor -- sitting
+/// the floor right under the two pink states reacts the instant real
+/// brightness starts dropping, instead of waiting through most of the
+/// fade toward dim before finally dropping out.
+const PINK_SKIN_WHITE_RANGE: HsvRange = ((0, 0, 220), (180, 100, 255));
 
 fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let (rf, gf, bf) = (r as f64, g as f64, b as f64);
@@ -381,12 +387,12 @@ const TRANSITION_DURATION: Duration = Duration::from_millis(800);
 /// nominal 800ms, and capture/physics latency can push the real overlap a
 /// touch past that. Without this buffer, a flash landing just after the
 /// 800ms cutoff gets missed and we reverse right as we were about to catch it.
-const TRANSITION_CONFIRM_BUFFER: Duration = Duration::from_millis(150);
-const SETTLE_GRACE: Duration = Duration::from_millis(150);
-const SETTLED_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TRANSITION_CONFIRM_BUFFER: Duration = Duration::from_millis(135);
+const SETTLE_GRACE: Duration = Duration::from_millis(135);
+const SETTLED_POLL_INTERVAL: Duration = Duration::from_millis(35);
 /// How long to hold off the bar_looks_gone() color-uniformity check after
 /// entering the settled loop, so a color mid-transition doesn't trip it.
-const SETTLE_STABLE_DELAY: Duration = Duration::from_millis(300);
+const SETTLE_STABLE_DELAY: Duration = Duration::from_millis(285);
 /// One full there-and-back swing cycle (2 unconfirmed legs) after having
 /// caught the flash at least once before -- that means the fight legitimately
 /// ended (fish caught/escaped/line broke), so give up and recast.
