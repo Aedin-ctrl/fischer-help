@@ -1,0 +1,25 @@
+[package]
+name = "fish_bar_bot"
+version = "0.1.0"
+edition = "2024"
+default-run = "fish_bar_bot"
+
+[dependencies]
+active-win-pos-rs = "0.11.0"
+anyhow = "1.0.104"
+eframe = "0.35.0"
+egui = "0.35.0"
+global-hotkey = "0.8.0"
+image = "0.25.10"
+rand = "0.10.2"
+raw-window-handle = "0.6.2"
+rdev = "0.5.3"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+xcap = "0.9.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSGeometry"] }
